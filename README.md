@@ -21,7 +21,7 @@
 | --- | --- |
 | Kotlin | Язык разработки |
 | Jetpack Compose и Material 3 | Интерфейс приложения |
-| SQLite | Локальное хранение данных |
+| Room и SQLite | Локальное хранение данных |
 | Gradle | Сборка проекта |
 | JUnit и AndroidX Test | Тестирование |
 

@@ -2,8 +2,9 @@ package com.example.zhd
 
 import android.content.ContentValues
 import android.content.Context
-import android.database.sqlite.SQLiteDatabase
-import android.database.sqlite.SQLiteOpenHelper
+import androidx.room.Room
+import androidx.sqlite.db.SimpleSQLiteQuery
+import androidx.sqlite.db.SupportSQLiteDatabase
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -21,16 +22,17 @@ val sections = listOf(
     Section("tickets", "Билеты", listOf(Field("schedule_id", "Рейс", reference = "schedules"), Field("employee_id", "Сотрудник", reference = "employees"), Field("passenger", "ФИО пассажира"), Field("passport", "Паспорт"), Field("seat", "Место", "int"), Field("price", "Стоимость, ₽", "int"), Field("status", "Статус", "status")))
 )
 
-class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpenHelper(context, name, null, 1) {
-    override fun onConfigure(db: SQLiteDatabase) { db.setForeignKeyConstraintsEnabled(true) }
-    override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE trains (id INTEGER PRIMARY KEY, number TEXT NOT NULL UNIQUE, category TEXT NOT NULL, seats INTEGER NOT NULL CHECK(seats > 0))")
-        db.execSQL("CREATE TABLE stations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL)")
-        db.execSQL("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, position TEXT NOT NULL)")
-        db.execSQL("CREATE TABLE schedules (id INTEGER PRIMARY KEY, train_id INTEGER NOT NULL REFERENCES trains(id) ON DELETE RESTRICT, departure_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE RESTRICT, arrival_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE RESTRICT, departure TEXT NOT NULL, arrival TEXT NOT NULL, price INTEGER NOT NULL CHECK(price > 0), CHECK(departure_id != arrival_id))")
-        db.execSQL("CREATE TABLE stops (id INTEGER PRIMARY KEY, schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT, station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE RESTRICT, position INTEGER NOT NULL CHECK(position > 0), arrival TEXT NOT NULL, departure TEXT NOT NULL, UNIQUE(schedule_id, position))")
-        db.execSQL("CREATE TABLE tickets (id INTEGER PRIMARY KEY, schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE RESTRICT, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT, passenger TEXT NOT NULL, passport TEXT NOT NULL, seat INTEGER NOT NULL CHECK(seat > 0), price INTEGER NOT NULL CHECK(price > 0), status TEXT NOT NULL CHECK(status IN ('Бронь', 'Куплен', 'Отменён')), owner TEXT NOT NULL DEFAULT 'employee')")
-        db.execSQL("CREATE UNIQUE INDEX occupied_seat ON tickets(schedule_id, seat) WHERE status != 'Отменён'")
+class StationDatabase(context: Context, name: String = "station.db") {
+    private val room = Room.databaseBuilder(context.applicationContext, StationRoomDatabase::class.java, name)
+        .addMigrations(MIGRATION_1_2)
+        .addCallback(StationRoomDatabase.callback)
+        .allowMainThreadQueries()
+        .build()
+
+    fun close() = room.close()
+
+    companion object {
+    fun seed(db: SupportSQLiteDatabase) {
         val cities = listOf("Москва", "Санкт-Петербург", "Казань", "Нижний Новгород", "Ярославль", "Владимир", "Тверь", "Рязань", "Самара", "Воронеж", "Пенза", "Тула")
         cities.forEachIndexed { i, city -> db.execSQL("INSERT INTO stations(id,name,city) VALUES(?,?,?)", arrayOf(i + 1, "$city вокзал", city)) }
         for (i in 1..10) {
@@ -46,11 +48,13 @@ class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpe
             db.execSQL("INSERT INTO tickets(schedule_id,employee_id,passenger,passport,seat,price,status,owner) VALUES(?,?,?,?,?,?,?,?)", arrayOf(i, i, "Пассажир $i", "4510 00000$i", 1, 1200 + i * 150, "Куплен", "employee"))
         }
     }
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    }
 
     fun rows(table: String, where: String? = null, args: Array<String>? = null): List<Row> {
         val result = mutableListOf<Row>()
-        readableDatabase.query(table, null, where, args, null, null, "id DESC").use { c ->
+        require(sections.any { it.table == table })
+        val query = "SELECT * FROM $table" + (where?.let { " WHERE $it" } ?: "") + " ORDER BY id DESC"
+        room.records().rows(SimpleSQLiteQuery(query, args ?: emptyArray())).use { c ->
             while (c.moveToNext()) result.add(c.columnNames.associateWith { c.getString(c.getColumnIndexOrThrow(it)) ?: "" })
         }
         return result
@@ -71,7 +75,7 @@ class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpe
         return (train["seats"]!!.toInt() - rows("tickets", "schedule_id = ? AND status != 'Отменён'", arrayOf(scheduleId)).size).coerceAtLeast(0)
     }
     fun save(section: Section, values: Map<String, String>, id: String? = null, owner: String? = null) {
-        val db = writableDatabase
+        val db = room.openHelper.writableDatabase
         db.beginTransaction()
         try {
             section.fields.forEach { f ->
@@ -92,7 +96,7 @@ class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpe
                     val stops = rows("stops", "schedule_id = ?", arrayOf(id))
                     require(stops.all { it["arrival"]!! >= values["departure"]!! && it["departure"]!! <= values["arrival"]!! }) { "Остановки должны находиться в пределах времени рейса" }
                     val train = rows("trains", "id = ?", arrayOf(values["train_id"]!!)).first()
-                    val maxSeat = db.rawQuery("SELECT MAX(seat) FROM tickets WHERE schedule_id=? AND status != 'Отменён'", arrayOf(id)).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+                    val maxSeat = db.query("SELECT MAX(seat) FROM tickets WHERE schedule_id=? AND status != 'Отменён'", arrayOf(id)).use { if (it.moveToFirst()) it.getInt(0) else 0 }
                     require(train["seats"]!!.toInt() >= maxSeat) { "В выбранном поезде нет уже занятых мест" }
                 }
             }
@@ -101,7 +105,7 @@ class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpe
                 require(values["arrival"]!! >= trip["departure"]!! && values["departure"]!! <= trip["arrival"]!! && values["arrival"]!! <= values["departure"]!!) { "Время остановки должно находиться в пределах рейса" }
             }
             if (section.table == "trains" && id != null) {
-                val used = db.rawQuery("SELECT MAX(t.seat) FROM tickets t JOIN schedules s ON s.id=t.schedule_id WHERE s.train_id=? AND t.status != 'Отменён'", arrayOf(id)).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+                val used = db.query("SELECT MAX(t.seat) FROM tickets t JOIN schedules s ON s.id=t.schedule_id WHERE s.train_id=? AND t.status != 'Отменён'", arrayOf(id)).use { if (it.moveToFirst()) it.getInt(0) else 0 }
                 require(values["seats"]!!.toInt() >= used) { "Количество мест меньше номера занятого места" }
             }
             if (section.table == "tickets") {
@@ -112,9 +116,9 @@ class StationDatabase(context: Context, name: String = "station.db") : SQLiteOpe
                 if (values["status"] != "Отменён") require(rows("tickets", "schedule_id = ? AND seat = ? AND status != 'Отменён' AND id != ?", arrayOf(values["schedule_id"]!!, values["seat"]!!, id ?: "-1")).isEmpty()) { "Это место уже занято" }
             }
             val cv = ContentValues().apply { section.fields.forEach { put(it.key, values[it.key]!!.trim()) }; if (owner != null) put("owner", owner) }
-            if (id == null) db.insertOrThrow(section.table, null, cv) else db.update(section.table, cv, "id = ?", arrayOf(id))
+            if (id == null) db.insert(section.table, android.database.sqlite.SQLiteDatabase.CONFLICT_ABORT, cv) else db.update(section.table, android.database.sqlite.SQLiteDatabase.CONFLICT_ABORT, cv, "id = ?", arrayOf(id))
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
     }
-    fun delete(table: String, id: String) { writableDatabase.delete(table, "id = ?", arrayOf(id)) }
+    fun delete(table: String, id: String) { room.openHelper.writableDatabase.delete(table, "id = ?", arrayOf(id)) }
 }
